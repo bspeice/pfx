@@ -1,0 +1,289 @@
+#!/bin/bash
+
+# TODO: Declare overrides by setting an environment variable
+
+PFX_DEBUG="${PFX_DEBUG:-}"
+PFX_PREFIX="${PFX_PREFIX:-$HOME/.prefix}"
+PFX_OPT="${PFX_OPT:-$HOME/.opt}"
+
+# Display a debug message
+# Args:
+#   - message: Message to display
+function __pfx_echo_debug() {
+    local message="$1"
+
+    if [[ "$PFX_DEBUG" ]]; then
+        echo "$message" >&2
+    fi
+}
+
+function __pfx_echo_error() {
+    local message="$1"
+    echo "$message" >&2
+}
+
+# Set a config value. Because getting unset values returns empty,
+# the value provided here must not be empty
+# Args:
+#   - config_key: Name of value
+#   - config_value: Value to set; must not be empty
+function __pfx_config_set() {
+    local config_key="$1"
+    local config_value="$2"
+
+    if [[ -z "$config_value" ]]; then
+        __pfx_echo_error "Config value must not be empty; config_key=$config_key,"
+        return 1
+    fi
+
+    __pfx_dir_assure "$PFX_OPT"
+    __pfx_echo_debug "Setting config; config_key=$config_key, config_value=$config_value"
+    echo "$config_value" > "$PFX_OPT/.$config_key"
+}
+
+# Unset a config value
+# Args:
+#   - config_key: Name of value
+function __pfx_config_unset() {
+    local config_key="$1"
+
+    __pfx_dir_assure "$PFX_OPT"
+    local config_file="$PFX_OPT/.$config_key"
+
+    if [[ ! -f "$config_file" ]]; then
+        __pfx_echo_debug "Config key is already unset; config_key=$config_key"
+        return 1
+    fi
+
+    rm "$config_file"
+}
+
+# Get a config value; return value will be empty if unset.
+# Args:
+#   - config_key: Name of value
+#   - return_var: Variable name to store results in
+function __pfx_config_get() {
+    local config_key="$1"
+    local return_var="$2"
+
+    local config_file="$PFX_OPT/.$config_key"
+
+    if [[ ! -f "$config_file" ]]; then
+        __pfx_echo_debug "Config key not found; config_key=$config_key"
+        eval "$return_var"=""
+        return
+    fi
+
+    local config_value
+    config_value="$(cat "$config_file")"
+
+    __pfx_echo_debug "Found key; config_key=$config_key, config_value=$config_value"
+    eval "$return_var"="$config_value"
+}
+
+# Verify a directory exists, creating if necessary
+# Args:
+#   - dir_name: Directory to create
+function __pfx_dir_assure() {
+    local dir_name="$1"
+
+    mkdir -p "$dir_name"
+    return $?
+}
+
+# Get the expected directory for a program/version pair
+# Args:
+#   - program: Program to check
+#   - version: Version to check
+#   - return_var: Variable name to store results in
+function __pfx_dir_program_version() {
+    local program="$1"
+    local version="$2"
+    local return_var="$3"
+
+    eval "$return_var"="$PFX_OPT/$program\|$version"
+}
+
+function __pfx_do_mount() {
+    local upper_program="${1:-}"
+
+    local upper_arg
+    if [[ "$upper_program" ]]; then
+        local work_dir="$PFX_OPT/.work"
+        __pfx_dir_assure "$work_dir"
+
+        local declared_version
+        __pfx_config_get "$upper_program" declared_version
+
+        local upper_dir
+        __pfx_dir_program_version "$program" "$declared_version" upper_dir
+        upper_arg="-o upperdir=\"$upper_dir\" -o workdir=\"$work_dir\""
+    fi
+
+    # Must always have a lower dir, so create a dummy folder
+    local lower_dummy_dir="$PFX_OPT/.lower"
+    __pfx_dir_assure "$lower_dummy_dir"
+
+    local lower_mounts="$lower_dummy_dir"
+    local current_program=""
+
+    __pfx_dir_assure "$PFX_OPT"
+    local loop_program
+    local loop_version
+    local loop_cfg_version
+    local loop_lower_dir
+    for program_version in $(find "$PFX_OPT" -mindepth 1 -maxdepth 1 -type d | sort -r); do
+        loop_program="$(basename "$program_version" | cut -d'|' -f1)"
+        loop_version="$(basename "$program_version" | cut -d'|' -f2)"
+
+        # Skip hidden files/folders
+        if [[ "$loop_program" =~ \\..* ]]; then
+            __pfx_echo_debug "Skipping lower directory candidate; program=$loop_program"
+            continue
+        fi
+
+        __pfx_echo_debug "Evaluation lower directory candidate; program=$loop_program, version=$loop_version"
+
+        if [[ "$loop_program" == "$current_program" ]]; then
+            # We've already encountered this program, no further work to do
+            __pfx_echo_debug "Already found a candidate; program=$loop_program, version=$loop_version"
+            continue
+        elif [[ "$loop_program" == "$upper_program" ]]; then
+            # This is the upper program, resolve later
+            __pfx_echo_debug "Skipping candidate because this program will be an upper; program=$program, version=$version"
+            continue
+        fi
+
+        # This is a lower program; set the version so we stop processing other entries
+        current_program="$loop_program"
+
+        # Check if an explicit version is declared
+        __pfx_config_get "$loop_program" loop_cfg_version
+
+        if [[ "$declared_version" ]]; then
+            # Explicit version set, prioritize that
+            __pfx_dir_program_version "$loop_program" "$loop_cfg_version" loop_lower_dir
+            
+            if [[ ! -d "$loop_lower_dir" ]]; then
+                __pfx_echo_error "Declared an unavailable program; maybe unset? program=$loop_program"
+                return 1
+            fi
+        else
+            # No explicit version set, use the current
+            __pfx_dir_program_version "$loop_program" "$loop_version" loop_lower_dir
+        fi
+
+        lower_mounts="$lower_mounts:$loop_lower_dir"
+    done
+
+    local lower_arg=""
+    if [[ "$lower_mounts" ]]; then
+        lower_arg="-o lowerdir=\"$lower_mounts\""
+    fi
+
+    fusermount -u "$PFX_PREFIX" 2>/dev/null || true
+
+    __pfx_dir_assure "$PFX_PREFIX"
+    command="fuse-overlayfs $lower_arg $upper_arg \"$PFX_PREFIX\""
+
+    __pfx_echo_debug "Executing: $command"
+    eval "$command"
+}
+
+function __pfx_command_help() {
+    cat <<EOF
+Usage: pfx [command] [program] [version]
+
+Commands:
+    help                        : Print this help message
+    prefix                      : Print the currently-set prefix (default)
+    mount                       : Set the prefix mount
+    install <program> <version> : Remount the prefix; new files/folders in the
+                                : prefix will be placed into this path
+    uninstall <program>         : Remount the prefix with <program> removed
+    set <program> <version>     : Remount the prefix; the provided program and
+                                : version will be active
+    unset <program>             : Remount the prefix; the provided program will
+                                : return to its default version (most recent)
+EOF
+}
+
+# Echo the current prefix without performing any other operations
+function __pfx_command_prefix() {
+    echo "$PFX_PREFIX"
+}
+
+# Re-mount the prefix with programs and versions as declared in the config.
+# Args:
+#   - upper_program (optional): Program to bind as the upper dir.
+#     Version should be set as a config.
+function __pfx_command_mount() {
+    __pfx_do_mount
+    __pfx_command_prefix
+}
+
+# Re-mount the prefix with all new files/folders created going to a particular
+# program and version.
+# Args:
+#   - program: Program to install
+#   - version: Version of program to install
+function __pfx_command_install() {
+    local program="$1"
+    local version="$2"
+
+    # TODO: No `-` in versions
+
+    local program_dir
+    __pfx_dir_program_version "$program" "$version" program_dir || return $?
+
+    __pfx_dir_assure "$program_dir" || return $?
+    __pfx_config_set "$program" "$version" || return $?
+    __pfx_do_mount "$program" || return $?
+    __pfx_config_unset "$program" "$version" || return $?
+
+    echo "$program_dir"
+}
+
+# Re-mount the prefix with a particular program removed
+# Args:
+#   - program: Program to uninstall
+function __pfx_command_uninstall() {
+    local program="$1"
+
+    __pfx_config_set "$program" "" || return $?
+    __pfx_do_mount || return $?
+}
+
+# Set the active version of program and re-mount
+# Args:
+#   - program: Program to set
+#   - version: Version of program to set
+function __pfx_command_set() {
+    local program="$1"
+    local version="$2"
+
+    config_set "$program" "$version" || return $?
+    command_mount || return $?
+}
+
+# Unset a particular version of a program (use the most recent) and re-mount
+# Args:
+#   - program: Program to restore default version
+function __pfx_command_unset() {
+    local program="$1"
+
+    __pfx_config_unset "$program" || return $?
+    __pfx_do_mount || return $?
+}
+
+function pfx() {
+    local command="${1:-}"
+    local program="${2:-}"
+    local version="${3:-}"
+
+    if [[ -z "$command" ]]; then
+        command="prefix"
+    fi
+
+    "__pfx_command_$command" "$program" "$version" || return $?
+}
